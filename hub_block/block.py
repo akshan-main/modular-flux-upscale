@@ -1,3 +1,252 @@
+"""Modular Flux Upscale - consolidated Hub block.
+
+MultiDiffusion tiled upscaling for Flux using Modular Diffusers.
+"""
+
+
+# ============================================================
+# utils_tiling
+# ============================================================
+
+"""Tile planning and cosine blending weights for MultiDiffusion."""
+
+from dataclasses import dataclass
+
+import torch
+
+
+@dataclass
+class LatentTileSpec:
+    """Tile specification in latent space.
+
+    Attributes:
+        y: Top edge in latent pixels.
+        x: Left edge in latent pixels.
+        h: Height in latent pixels.
+        w: Width in latent pixels.
+    """
+
+    y: int
+    x: int
+    h: int
+    w: int
+
+
+def validate_tile_params(tile_size: int, overlap: int) -> None:
+    if tile_size <= 0:
+        raise ValueError(f"`tile_size` must be positive, got {tile_size}.")
+    if overlap < 0:
+        raise ValueError(f"`overlap` must be non-negative, got {overlap}.")
+    if overlap >= tile_size:
+        raise ValueError(
+            f"`overlap` must be less than `tile_size`. "
+            f"Got overlap={overlap}, tile_size={tile_size}."
+        )
+
+
+def plan_latent_tiles(
+    latent_h: int,
+    latent_w: int,
+    tile_size: int = 64,
+    overlap: int = 8,
+) -> list[LatentTileSpec]:
+    """Plan overlapping tiles in latent space for MultiDiffusion.
+
+    Tiles overlap by ``overlap`` latent pixels. Edge tiles are clamped to
+    the latent bounds.
+    """
+    validate_tile_params(tile_size, overlap)
+
+    stride = tile_size - overlap
+    tiles: list[LatentTileSpec] = []
+
+    y = 0
+    while y < latent_h:
+        h = min(tile_size, latent_h - y)
+        if h < tile_size and y > 0:
+            y = max(0, latent_h - tile_size)
+            h = latent_h - y
+
+        x = 0
+        while x < latent_w:
+            w = min(tile_size, latent_w - x)
+            if w < tile_size and x > 0:
+                x = max(0, latent_w - tile_size)
+                w = latent_w - x
+
+            tiles.append(LatentTileSpec(y=y, x=x, h=h, w=w))
+
+            if x + w >= latent_w:
+                break
+            x += stride
+
+        if y + h >= latent_h:
+            break
+        y += stride
+
+    return tiles
+
+
+def make_cosine_tile_weight(
+    h: int,
+    w: int,
+    overlap: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    is_top: bool = False,
+    is_bottom: bool = False,
+    is_left: bool = False,
+    is_right: bool = False,
+) -> torch.Tensor:
+    """Boundary-aware cosine blending weight for one tile.
+
+    Returns shape (1, 1, h, w).  Canvas-edge sides get weight 1.0 (no fade),
+    interior overlap regions get a half-cosine ramp from 0 to 1.
+    """
+    import math
+
+    wy = torch.ones(h, device=device, dtype=dtype)
+    wx = torch.ones(w, device=device, dtype=dtype)
+
+    ramp = min(overlap, h // 2, w // 2)
+    if ramp <= 0:
+        return torch.ones(1, 1, h, w, device=device, dtype=dtype)
+
+    cos_ramp = torch.tensor(
+        [0.5 * (1 - math.cos(math.pi * i / ramp)) for i in range(ramp)],
+        device=device,
+        dtype=dtype,
+    )
+
+    if not is_top:
+        wy[:ramp] = cos_ramp
+    if not is_bottom:
+        wy[-ramp:] = cos_ramp.flip(0)
+    if not is_left:
+        wx[:ramp] = cos_ramp
+    if not is_right:
+        wx[-ramp:] = cos_ramp.flip(0)
+
+    weight = wy[:, None] * wx[None, :]
+    return weight.unsqueeze(0).unsqueeze(0)
+
+
+# ============================================================
+# input
+# ============================================================
+
+"""Input steps for Flux upscaling: text encoding, Lanczos upscale."""
+
+import PIL.Image
+import torch
+
+from diffusers.utils import logging
+from diffusers.modular_pipelines.modular_pipeline import ModularPipelineBlocks, PipelineState
+from diffusers.modular_pipelines.modular_pipeline_utils import InputParam, OutputParam
+from diffusers.modular_pipelines.flux.encoders import FluxTextEncoderStep
+
+logger = logging.get_logger(__name__)
+
+
+class FluxUpscaleTextEncoderStep(FluxTextEncoderStep):
+    """Flux text encoder step with guidance_scale input.
+
+    Flux uses guidance embedding (a tensor), not CFG. This step stores the
+    guidance_scale so downstream blocks can create the guidance tensor.
+    """
+
+    @property
+    def inputs(self) -> list[InputParam]:
+        return super().inputs + [
+            InputParam(
+                "guidance_scale",
+                type_hint=float,
+                default=3.5,
+                description="Guidance scale for Flux guidance embedding.",
+            ),
+        ]
+
+    @torch.no_grad()
+    def __call__(self, components, state: PipelineState) -> PipelineState:
+        # Store guidance_scale in state for downstream blocks
+        block_state = self.get_block_state(state)
+        guidance_scale = getattr(block_state, "guidance_scale", 3.5)
+        state.set("guidance_scale", guidance_scale)
+        return super().__call__(components, state)
+
+
+class FluxUpscaleUpscaleStep(ModularPipelineBlocks):
+    """Upscales the input image using Lanczos interpolation."""
+
+    @property
+    def description(self) -> str:
+        return "Upscale input image using Lanczos interpolation."
+
+    @property
+    def inputs(self) -> list[InputParam]:
+        return [
+            InputParam("image", type_hint=PIL.Image.Image, required=True,
+                       description="Input PIL image to upscale."),
+            InputParam("upscale_factor", type_hint=float, default=2.0,
+                       description="Scale multiplier."),
+        ]
+
+    @property
+    def intermediate_outputs(self) -> list[OutputParam]:
+        return [
+            OutputParam("upscaled_image", type_hint=PIL.Image.Image,
+                        description="Lanczos-upscaled PIL image."),
+            OutputParam("upscaled_width", type_hint=int),
+            OutputParam("upscaled_height", type_hint=int),
+        ]
+
+    @torch.no_grad()
+    def __call__(self, components, state: PipelineState) -> PipelineState:
+        block_state = self.get_block_state(state)
+        image = block_state.image
+        factor = block_state.upscale_factor
+
+        if not isinstance(image, PIL.Image.Image):
+            if hasattr(image, "convert"):
+                image = image.convert("RGB")
+            else:
+                raise TypeError(f"Expected PIL.Image, got {type(image)}")
+
+        w, h = image.size
+        new_w = int(round(w * factor))
+        new_h = int(round(h * factor))
+
+        # Ensure divisible by 16 (VAE scale 8 * packing factor 2)
+        new_w = (new_w // 16) * 16
+        new_h = (new_h // 16) * 16
+
+        if new_w < 16 or new_h < 16:
+            raise ValueError(
+                f"Upscaled size ({new_w}x{new_h}) too small. "
+                f"Input {w}x{h} with factor {factor}."
+            )
+
+        upscaled = image.resize((new_w, new_h), PIL.Image.LANCZOS)
+
+        block_state.upscaled_image = upscaled
+        block_state.upscaled_width = new_w
+        block_state.upscaled_height = new_h
+
+        # Also set height/width for downstream blocks (set_timesteps needs these)
+        state.set("height", new_h)
+        state.set("width", new_w)
+        state.set("image", image)
+
+        logger.info(f"Upscaled {w}x{h} -> {new_w}x{new_h} (factor={factor})")
+
+        self.set_block_state(state, block_state)
+        return components, state
+
+
+# ============================================================
+# denoise
+# ============================================================
+
 """MultiDiffusion tiled upscaling step for Flux 1.
 
 Runs the Flux transformer on overlapping latent tiles with cosine-weighted
@@ -22,10 +271,6 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.modular_pipelines.modular_pipeline import ModularPipelineBlocks, PipelineState
 from diffusers.modular_pipelines.modular_pipeline_utils import ComponentSpec, InputParam, OutputParam
 
-try:
-    from .utils_tiling import LatentTileSpec, make_cosine_tile_weight, plan_latent_tiles
-except ImportError:
-    from utils_tiling import LatentTileSpec, make_cosine_tile_weight, plan_latent_tiles
 
 logger = logging.get_logger(__name__)
 
@@ -645,3 +890,66 @@ class FluxUpscaleMultiDiffusionStep(ModularPipelineBlocks):
 
         self.set_block_state(state, block_state)
         return components, state
+
+
+# ============================================================
+# modular_blocks
+# ============================================================
+
+"""Block compositions for Flux tiled upscaling."""
+
+from diffusers.modular_pipelines.modular_pipeline import SequentialPipelineBlocks
+from diffusers.modular_pipelines.flux.before_denoise import FluxSetTimestepsStep
+from diffusers.modular_pipelines.flux.inputs import FluxTextInputStep
+
+# Classes FluxUpscaleTextEncoderStep, FluxUpscaleUpscaleStep,
+# FluxUpscaleMultiDiffusionStep are defined above in this file.
+
+
+class FluxUpscaleMultiDiffusionBlocks(SequentialPipelineBlocks):
+    """Modular pipeline blocks for tiled Flux upscaling with MultiDiffusion.
+
+    Block graph:
+        [0] text_encoder    - FluxUpscaleTextEncoderStep
+        [1] upscale         - FluxUpscaleUpscaleStep (Lanczos)
+        [2] input           - FluxTextInputStep (sets batch_size, dtype)
+        [3] set_timesteps   - FluxSetTimestepsStep (reused)
+        [4] multidiffusion  - FluxUpscaleMultiDiffusionStep
+    """
+
+    block_classes = [
+        FluxUpscaleTextEncoderStep,
+        FluxUpscaleUpscaleStep,
+        FluxTextInputStep,
+        FluxSetTimestepsStep,
+        FluxUpscaleMultiDiffusionStep,
+    ]
+    block_names = ["text_encoder", "upscale", "input", "set_timesteps", "multidiffusion"]
+
+    @property
+    def description(self) -> str:
+        return (
+            "Modular tiled upscaling pipeline for Flux.\n"
+            "Uses MultiDiffusion latent-space blending with optional ControlNet.\n"
+            "Supports progressive multi-pass upscaling for 4x+."
+        )
+
+
+# ============================================================
+# modular_pipeline
+# ============================================================
+
+"""Modular pipeline class for tiled Flux upscaling."""
+
+from diffusers.modular_pipelines.flux.modular_pipeline import FluxModularPipeline
+
+
+class FluxUpscaleModularPipeline(FluxModularPipeline):
+    """A ModularPipeline for tiled Flux upscaling.
+
+    Inherits all Flux component properties and overrides the default blocks
+    to use the tiled upscaling block composition.
+    """
+
+    default_blocks_name = "FluxUpscaleMultiDiffusionBlocks"
+
