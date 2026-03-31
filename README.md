@@ -3,7 +3,7 @@
 Tiled image upscaling for Flux using [MultiDiffusion](https://arxiv.org/abs/2302.08113) latent-space blending. Built with [Modular Diffusers](https://huggingface.co/blog/modular-diffusers).
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/gist/akshan-main/96e67dbe8b0792949e0da715fbbf7d11/modular_flux_upscale_demo.ipynb)
-[![HuggingFace Hub](https://img.shields.io/badge/HuggingFace-Hub-yellow)](https://huggingface.co/akshan-main/modular-flux1-upscale)
+[![HuggingFace Hub](https://img.shields.io/badge/HuggingFace-Hub-yellow)](https://huggingface.co/akshan-main/modular-flux-upscale)
 
 ## What it does
 
@@ -32,7 +32,7 @@ from diffusers.models.controlnets.controlnet_flux import FluxControlNetModel
 import torch
 
 blocks = ModularPipelineBlocks.from_pretrained(
-    "akshan-main/modular-flux1-upscale",
+    "akshan-main/modular-flux-upscale",
     trust_remote_code=True,
 )
 
