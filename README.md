@@ -2,7 +2,7 @@
 
 Tiled image upscaling for Flux using [MultiDiffusion](https://arxiv.org/abs/2302.08113) latent-space blending. Built with [Modular Diffusers](https://huggingface.co/blog/modular-diffusers).
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/gist/akshan-main/96e67dbe8b0792949e0da715fbbf7d11/modular_flux_upscale_demo.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/gist/akshan-main/e7a96626058b5a2065d70b25a2e35c37/modular_flux_upscale_demo.ipynb)
 [![HuggingFace Hub](https://img.shields.io/badge/HuggingFace-Hub-yellow)](https://huggingface.co/akshan-main/modular-flux-upscale)
 
 ## What it does
@@ -27,23 +27,21 @@ Requires diffusers from main (modular diffusers support).
 ### From HuggingFace Hub
 
 ```python
-from diffusers import ModularPipelineBlocks
+from diffusers import ModularPipeline
 from diffusers.models.controlnets.controlnet_flux import FluxControlNetModel
 import torch
 
-blocks = ModularPipelineBlocks.from_pretrained(
+pipe = ModularPipeline.from_pretrained(
     "akshan-main/modular-flux-upscale",
     trust_remote_code=True,
 )
-
-pipe = blocks.init_pipeline("black-forest-labs/FLUX.1-dev")
 pipe.load_components(torch_dtype=torch.bfloat16)
 
 controlnet = FluxControlNetModel.from_pretrained(
     "jasperai/Flux.1-dev-Controlnet-Upscaler", torch_dtype=torch.bfloat16
 )
 pipe.update_components(controlnet=controlnet)
-pipe.enable_model_cpu_offload()
+pipe.to("cuda")
 
 image = ...  # your PIL image
 
